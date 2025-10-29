@@ -1,5 +1,26 @@
 import { Room, Client } from "colyseus";
 import { Schema, defineTypes } from "@colyseus/schema";
+import {
+  MESSAGE,
+  MOVEMENT_LIMITS,
+  PositionMessage,
+  SpawnMessage,
+  SnapshotMessage,
+  DespawnMessage,
+  clampPosition,
+  clonePosition,
+  distance3d,
+  isPositionPayload,
+  PositionPayload,
+  sanitizePlayerName,
+  DEFAULT_PLAYER_NAME,
+  isChatPayload,
+  sanitizeChatText,
+  makeChatMessage,
+  ChatMessage,
+  ChatHistoryMessage,
+  CHAT_LIMITS,
+} from "@shared";
 
 class Vec3 extends Schema {
   x: number = 0;
@@ -12,52 +33,173 @@ defineTypes(Vec3, {
   z: "number",
 });
 
-class State extends Schema {} // pas utilisé pour l’instant
+class State extends Schema {}
+
+type PlayerState = {
+  position: Vec3;
+  lastUpdate: number;
+  name: string;
+};
+
+const toPositionPayload = (vec: Vec3): PositionPayload => ({
+  x: vec.x,
+  y: vec.y,
+  z: vec.z,
+});
+
+type JoinOptions = {
+  name?: string;
+};
+
+const SYSTEM_SENDER = "System";
 
 export class GameRoom extends Room<State> {
   maxClients = 50;
 
-  // Mémoire volatile des positions
-  private players = new Map<string, Vec3>(); // sessionId -> position
+  private players = new Map<string, PlayerState>();
+  private chatHistory: ChatMessage[] = [];
+  private nextNameIndex = 1;
 
-  onCreate(_options: any) {
+  onCreate(_options: unknown) {
     this.setState(new State());
 
-    // Réception des positions: maj mémoire + broadcast aux autres
-    this.onMessage("pos", (client, data: { x:number; y:number; z:number }) => {
-      const p = this.players.get(client.sessionId);
-      if (p) { p.x = data.x; p.y = data.y; p.z = data.z; }
-      this.broadcast("pos", { id: client.sessionId, x: data.x, y: data.y, z: data.z }, { except: client });
+    this.onMessage(MESSAGE.POSITION, (client, data: unknown) => {
+      const player = this.players.get(client.sessionId);
+      if (!player || !isPositionPayload(data)) {
+        return;
+      }
+
+      const now = Date.now();
+      const elapsed = now - player.lastUpdate;
+      if (elapsed < MOVEMENT_LIMITS.MIN_INTERVAL_MS) {
+        return; // flood protection
+      }
+
+      const next = clampPosition(data);
+      if (elapsed > 0) {
+        const current = toPositionPayload(player.position);
+        const speed = distance3d(current, next) / (elapsed / 1000);
+        if (speed > MOVEMENT_LIMITS.MAX_SPEED) {
+          console.warn(
+            `Ignoring suspicious movement from ${client.sessionId} (speed=${speed.toFixed(2)})`
+          );
+          return;
+        }
+      }
+
+      player.position.x = next.x;
+      player.position.y = next.y;
+      player.position.z = next.z;
+      player.lastUpdate = now;
+
+      const message: PositionMessage = {
+        id: client.sessionId,
+        position: clonePosition(next),
+      };
+      this.broadcast(MESSAGE.POSITION, message, { except: client });
+    });
+
+    this.onMessage(MESSAGE.CHAT, (client, data: unknown) => {
+      const player = this.players.get(client.sessionId);
+      if (!player || !isChatPayload(data)) {
+        return;
+      }
+
+      const text = sanitizeChatText(data.text);
+      if (!text) {
+        return;
+      }
+
+      const message = makeChatMessage(client.sessionId, player.name, text);
+      this.recordChatMessage(message);
     });
   }
 
-onJoin(client: Client) {
-  console.log("Client joined:", client.sessionId);
+  onJoin(client: Client, options: JoinOptions) {
+    console.log("Client joined:", client.sessionId);
 
-  // 1) Envoyer au nouveau un snapshot des joueurs déjà présents
-  const snapshot = [...this.players.entries()].map(([id, pos]) => ({ id, x: pos.x, y: pos.y, z: pos.z }));
-  if (snapshot.length > 0) client.send("snapshot", snapshot);
+    const name = this.allocateName(options?.name);
 
-  // 2) Position de départ aléatoire mais visible : on restreint l'axe X et on force l'axe Z positif
-  const start = new Vec3();
-  const R = 4;
-  // X dans [−R/2, R/2] pour rester dans le champ latéral, Y fixe à 0.5
-  start.x = (Math.random() * 2 - 1) * (R / 2);
-  start.y = 0.5;
-  // Z entre 2 et R+2 (2 à 6) toujours devant la caméra
-  start.z = 2 + Math.random() * R;
-  this.players.set(client.sessionId, start);
+    const snapshot: SnapshotMessage = {
+      players: Array.from(this.players.entries()).map(([id, player]) => ({
+        id,
+        name: player.name,
+        position: clonePosition(toPositionPayload(player.position)),
+      })),
+    };
+    if (snapshot.players.length > 0) {
+      client.send(MESSAGE.SNAPSHOT, snapshot);
+    }
 
-  // 3) Annoncer le spawn : aux autres (sauf moi) et à moi‑même
-  this.broadcast("spawn", { id: client.sessionId, x: start.x, y: start.y, z: start.z }, { except: client });
-  client.send("spawn", { id: client.sessionId, x: start.x, y: start.y, z: start.z });
+    const spawnPosition = this.generateSpawnPosition();
+    const vec = new Vec3();
+    vec.x = spawnPosition.x;
+    vec.y = spawnPosition.y;
+    vec.z = spawnPosition.z;
 
-  } // fin de onJoin
+    this.players.set(client.sessionId, {
+      position: vec,
+      lastUpdate: Date.now(),
+      name,
+    });
+
+    const spawn: SpawnMessage = {
+      id: client.sessionId,
+      name,
+      position: clonePosition(spawnPosition),
+    };
+
+    this.broadcast(MESSAGE.SPAWN, spawn, { except: client });
+    client.send(MESSAGE.SPAWN, spawn);
+
+    if (this.chatHistory.length > 0) {
+      const history: ChatHistoryMessage = { history: this.chatHistory };
+      client.send(MESSAGE.CHAT_HISTORY, history);
+    }
+
+    this.recordChatMessage(
+      makeChatMessage(null, SYSTEM_SENDER, `${name} entered the world.`, true)
+    );
+  }
 
   onLeave(client: Client) {
     console.log("Client left:", client.sessionId);
+    const departing = this.players.get(client.sessionId);
     this.players.delete(client.sessionId);
-    this.broadcast("despawn", { id: client.sessionId });
-  }
-} // fin de classe GameRoom
 
+    const despawn: DespawnMessage = { id: client.sessionId };
+    this.broadcast(MESSAGE.DESPAWN, despawn);
+
+    if (departing) {
+      this.recordChatMessage(
+        makeChatMessage(
+          null,
+          SYSTEM_SENDER,
+          `${departing.name} left the world.`,
+          true
+        )
+      );
+    }
+  }
+
+  private generateSpawnPosition(): PositionPayload {
+    const radius = 4;
+    const x = (Math.random() * 2 - 1) * (radius / 2);
+    const y = 0.5;
+    const z = 2 + Math.random() * radius;
+    return clampPosition({ x, y, z });
+  }
+
+  private allocateName(requested?: string): string {
+    const fallback = `${DEFAULT_PLAYER_NAME} ${this.nextNameIndex++}`;
+    return sanitizePlayerName(requested, fallback);
+  }
+
+  private recordChatMessage(message: ChatMessage) {
+    this.chatHistory.push(message);
+    if (this.chatHistory.length > CHAT_LIMITS.HISTORY_LIMIT) {
+      this.chatHistory.splice(0, this.chatHistory.length - CHAT_LIMITS.HISTORY_LIMIT);
+    }
+    this.broadcast(MESSAGE.CHAT, message);
+  }
+}
