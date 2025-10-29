@@ -4,7 +4,8 @@
   "private": true,
   "type": "commonjs",
   "scripts": {
-    "dev": "ts-node src/index.ts"
+    "dev": "ts-node src/index.ts",
+    "typecheck": "tsc --noEmit"
   },
   "dependencies": {
     "@colyseus/schema": "^2.0.11",

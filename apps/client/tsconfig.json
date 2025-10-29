@@ -13,7 +13,12 @@
     "isolatedModules": true,
     "noEmit": true,
     "esModuleInterop": true,
-    "strict": false
+    "strict": false,
+    "baseUrl": ".",
+    "paths": {
+      "@shared": ["../../packages/shared/src"],
+      "@shared/*": ["../../packages/shared/src/*"]
+    }
   },
   "include": [
     "src"
